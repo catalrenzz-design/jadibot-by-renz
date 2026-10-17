@@ -1,12 +1,168 @@
-{
-  "name": "jadibot-by-renz",
-  "version": "1.0.0",
-  "main": "index.js",
-  "type": "module",
-  "scripts": { "start": "node index.js" },
-  "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.18",
-    "qrcode-terminal": "^0.12.0",
-    "pino": "^9.4.0"
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  Browsers,
+  delay,
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const fs = require('fs');
+
+const SESSION_DIR = './session';
+const PHONE_NUMBER = process.argv[2] || process.env.WA_NUMBER;
+const PAIRING_DELAY = 3000;
+const SILENT_LOGGER = pino({ level: 'silent' });
+
+if (!PHONE_NUMBER) {
+  console.error('❌ Nomor WA wajib! Set env WA_NUMBER atau argumen pertama.');
+  process.exit(1);
+}
+
+let sock = null;
+let isConnecting = false;
+let reconnectAttempts = 0;
+
+// Simpan pairing code ke file agar bisa dibaca dari log GitHub
+function savePairingCode(code) {
+  try {
+    fs.writeFileSync('PAIRING_CODE.txt', code, 'utf8');
+    console.log(`🔑 Pairing code disimpan ke PAIRING_CODE.txt`);
+  } catch (e) {
+    console.error('Gagal simpan pairing code:', e.message);
   }
 }
+
+async function startBot() {
+  if (isConnecting) return;
+  isConnecting = true;
+
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+    const { version } = await fetchLatestBaileysVersion();
+
+    sock = makeWASocket({
+      version,
+      logger: SILENT_LOGGER,
+      printQRInTerminal: false,
+      browser: Browsers.ubuntu('Chrome'),
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, SILENT_LOGGER),
+      },
+      generateHighQualityLinkPreview: true,
+      syncFullHistory: false,
+      markOnlineOnConnect: true,
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    if (!sock.authState.creds.registered) {
+      console.log('⏳ Menunggu 3 detik sebelum request pairing code...');
+      await delay(PAIRING_DELAY);
+
+      try {
+        const cleanNumber = PHONE_NUMBER.replace(/\D/g, '');
+        const code = await sock.requestPairingCode(cleanNumber);
+        const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
+
+        console.log('\n╔══════════════════════════════════════╗');
+        console.log('║       🔑 PAIRING CODE ANDA           ║');
+        console.log('╠══════════════════════════════════════╣');
+        console.log(`║        ➤  ${formatted.padEnd(25)}║`);
+        console.log('╚══════════════════════════════════════╝\n');
+
+        savePairingCode(formatted);
+      } catch (err) {
+        console.error('❌ Gagal request pairing code:', err?.message || err);
+      }
+    }
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect } = update;
+
+      if (connection === 'close') {
+        isConnecting = false;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+        console.log(`⚠️  Koneksi terputus (code: ${statusCode})`);
+
+        if (shouldReconnect) {
+          reconnectAttempts++;
+          const waitTime = Math.min(3000 * reconnectAttempts, 30000);
+          console.log(`🔄 Reconnect dalam ${waitTime / 1000}s...`);
+          await delay(waitTime);
+          startBot();
+        } else {
+          console.log('🚪 Logged out. Hapus folder session.');
+          process.exit(0);
+        }
+      } else if (connection === 'open') {
+        isConnecting = false;
+        reconnectAttempts = 0;
+        console.log('✅ Bot terhubung ke WhatsApp!');
+      }
+    });
+
+    sock.ev.on('messages.upsert', async (m) => {
+      try {
+        const msg = m.messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+
+        const from = msg.key.remoteJid;
+        const text =
+          msg.message.conversation ||
+          msg.message.extendedTextMessage?.text ||
+          '';
+        if (!text) return;
+
+        const command = text.trim().toLowerCase();
+        const pushName = msg.pushName || 'Kak';
+
+        if (command === '.ping') {
+          const start = Date.now();
+          await sock.sendMessage(from, { text: '🏓 Pong!' }, { quoted: msg });
+          const latency = Date.now() - start;
+          await sock.sendMessage(from, {
+            text: `⚡ *Pong!*\n📊 Latency: *${latency}ms*`,
+          }, { quoted: msg });
+        }
+
+        if (command === '.menu') {
+          const menuText = `
+╔══════════════════════════╗
+║      🤖 *BOT MENU*       ║
+╚══════════════════════════╝
+
+Halo *${pushName}*! 👋
+
+┌─ 📌 *UTAMA*
+│ • *.menu* → Menu ini
+│ • *.ping* → Cek latency
+└──────────────
+
+> _Powered by Baileys + GitHub Actions_
+`.trim();
+          await sock.sendMessage(from, { text: menuText }, { quoted: msg });
+        }
+      } catch (err) {
+        console.error('❌ Error handling:', err?.message || err);
+      }
+    });
+
+  } catch (err) {
+    isConnecting = false;
+    console.error('❌ Error start:', err?.message || err);
+    reconnectAttempts++;
+    await delay(5000);
+    startBot();
+  }
+}
+
+process.on('SIGINT', async () => { try { await sock?.end?.(); } catch {} process.exit(0); });
+process.on('uncaughtException', (e) => console.error('💥', e?.message));
+process.on('unhandledRejection', (e) => console.error('💥', e?.message));
+
+startBot();
